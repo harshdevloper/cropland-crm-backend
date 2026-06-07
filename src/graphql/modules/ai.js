@@ -124,6 +124,7 @@ export const aiTypeDefs = /* GraphQL */ `
     diseasesByDistrict: [DistrictDisease!]!
   }
 
+  input UpdateLeadInput { crop: String, disease: String, status: String, notes: String }
   input RunDiagnosisInput { farmerId: ID, crop: String!, imageUrl: String, gpsLat: Float, gpsLng: Float }
   input GenerateAdvisoryInput { diagnosisId: ID, farmerId: ID, crop: String!, disease: String, type: String = "CURATIVE" }
   input UpdateAdvisoryInput { crop: String!, disease: String, type: String!, title: String!, body: String!, farmerId: ID }
@@ -150,6 +151,8 @@ export const aiTypeDefs = /* GraphQL */ `
     createLeadFromDiagnosis(diagnosisId: ID!): CrmLead!
     assignLead(id: ID!, userId: ID!): CrmLead!
     updateLeadStatus(id: ID!, status: String!, notes: String): CrmLead!
+    updateLead(id: ID!, input: UpdateLeadInput!): CrmLead!
+    deleteLead(id: ID!): Boolean!
     sendAdvisory(id: ID!): Advisory!
 
     createTrainingClass(input: TrainingClassInput!): AiTrainingClass!
@@ -531,6 +534,30 @@ export function aiResolvers() {
         await logActivity(a.sub, 'UPDATE_LEAD', 'crm_lead', id, { status });
         const full = await query('SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name FROM crm_leads l LEFT JOIN farmers f ON f.id=l.farmer_id LEFT JOIN users u ON u.id=l.assigned_to WHERE l.id=$1', [id]);
         return mapLead(full.rows[0]);
+      },
+
+      updateLead: async (_p, { id, input }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        if (input.status && !['NEW', 'CONTACTED', 'CONVERTED', 'LOST'].includes(input.status)) throw httpError('Invalid lead status', 400);
+        // COALESCE keeps the existing value when a field is omitted from the edit.
+        const { rows } = await query(
+          `UPDATE crm_leads SET crop=COALESCE($2, crop), disease=COALESCE($3, disease),
+             status=COALESCE($4, status), notes=COALESCE($5, notes), updated_at=now()
+           WHERE id=$1 RETURNING id`,
+          [id, input.crop ?? null, input.disease ?? null, input.status ?? null, input.notes ?? null],
+        );
+        if (!rows[0]) throw httpError('Lead not found', 404);
+        await logActivity(a.sub, 'UPDATE_LEAD', 'crm_lead', id, {});
+        const full = await query('SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name FROM crm_leads l LEFT JOIN farmers f ON f.id=l.farmer_id LEFT JOIN users u ON u.id=l.assigned_to WHERE l.id=$1', [id]);
+        return mapLead(full.rows[0]);
+      },
+
+      deleteLead: async (_p, { id }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const { rowCount } = await query('DELETE FROM crm_leads WHERE id=$1', [id]);
+        if (!rowCount) throw httpError('Lead not found', 404);
+        await logActivity(a.sub, 'DELETE_LEAD', 'crm_lead', id);
+        return true;
       },
 
       sendAdvisory: async (_p, { id }, ctx) => {

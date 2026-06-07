@@ -57,6 +57,7 @@ export const financeTypeDefs = /* GraphQL */ `
 
   extend type Query {
     distributorLedger(distributorId: ID!): DistributorLedger!
+    farmerLedger(farmerId: ID!): DistributorLedger!
     creditDebitNotes(distributorId: ID): [CreditDebitNote!]!
     overdueInvoices(distributorId: ID): [OverdueInvoice!]!
   }
@@ -125,6 +126,42 @@ export function financeResolvers() {
         return {
           distributorId,
           distributorName: d.rows[0].name,
+          openingBalance: 0,
+          closingBalance: bal,
+          entries,
+        };
+      },
+
+      // Farmer ledger mirrors the distributor one but draws on farmer-scoped
+      // invoices/payments. Farmers have no credit/debit notes (those are
+      // distributor-only by schema), so the ledger is invoices + payments.
+      farmerLedger: async (_p, { farmerId }, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const f = await query('SELECT name FROM farmers WHERE id = $1', [farmerId]);
+        if (!f.rows[0]) throw httpError('Farmer not found', 404);
+
+        const invoices = await query(
+          'SELECT invoice_no, invoice_date AS dt, total_amount FROM invoices WHERE farmer_id = $1 AND status <> $2',
+          [farmerId, 'CANCELLED'],
+        );
+        const payments = await query('SELECT amount, paid_at AS dt, reference FROM payments WHERE farmer_id = $1', [farmerId]);
+
+        const entries = [];
+        for (const r of invoices.rows)
+          entries.push({ date: isoDate(r.dt), sort: new Date(r.dt).getTime(), type: 'INVOICE', ref: r.invoice_no, particulars: 'Sales invoice', debit: num(r.total_amount), credit: 0 });
+        for (const r of payments.rows)
+          entries.push({ date: isoDate(r.dt), sort: new Date(r.dt).getTime(), type: 'PAYMENT', ref: r.reference || 'Payment', particulars: 'Payment received', debit: 0, credit: num(r.amount) });
+
+        entries.sort((a, b) => a.sort - b.sort);
+        let bal = 0;
+        for (const e of entries) {
+          bal = Math.round((bal + e.debit - e.credit) * 100) / 100;
+          e.balance = bal;
+          delete e.sort;
+        }
+        return {
+          distributorId: farmerId,
+          distributorName: f.rows[0].name,
           openingBalance: 0,
           closingBalance: bal,
           entries,

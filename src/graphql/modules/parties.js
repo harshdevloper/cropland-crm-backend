@@ -277,6 +277,24 @@ export function partyResolvers() {
               [sale.id, l.productId, name, l.batchNumber ?? null, l.quantity, l.unitPrice, gst, lineTotal],
             );
           }
+          // Auto-generate a CRM lead when a farmer buys — a fresh upsell/follow-up
+          // opportunity. Skip if the farmer already has an open lead, so the
+          // pipeline doesn't flood with one lead per purchase.
+          if (input.partyType === 'FARMER') {
+            const hasOpen = (await client.query(
+              "SELECT 1 FROM crm_leads WHERE farmer_id=$1 AND status IN ('NEW','CONTACTED') LIMIT 1",
+              [input.partyId],
+            )).rows[0];
+            if (!hasOpen) {
+              const crops = (await client.query('SELECT crops FROM farmers WHERE id=$1', [input.partyId])).rows[0]?.crops ?? [];
+              const leadNo = `LEAD-${String((await client.query("SELECT nextval('lead_seq') n")).rows[0].n).padStart(5, '0')}`;
+              await client.query(
+                `INSERT INTO crm_leads (lead_no, farmer_id, crop, disease, product_ids, prior_purchase, notes)
+                 VALUES ($1,$2,$3,NULL,$4,TRUE,$5)`,
+                [leadNo, input.partyId, crops[0] ?? null, prepared.map((p) => p.l.productId), `Auto-created from direct sale ${saleNo}`],
+              );
+            }
+          }
           await logActivity(a.sub, 'CREATE_PARTY_SALE', 'party_sale', sale.id, { saleNo, party: input.partyType });
           return mapSale((await client.query(`${SALE_SELECT} WHERE s.id=$1`, [sale.id])).rows[0]);
         });

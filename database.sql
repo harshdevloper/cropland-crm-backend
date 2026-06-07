@@ -119,6 +119,22 @@ DELETE FROM role_permissions WHERE module NOT IN (
   'AI Advisory','Complaints','Analytics'
 );
 
+-- Per-user permission overrides: an explicit grant/deny for a single user on a
+-- module, taking precedence over their role's default (PRD §2.1). When no row
+-- exists for (user, module), the user inherits the role_permissions default.
+CREATE TABLE IF NOT EXISTS user_permissions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  module      TEXT NOT NULL,
+  can_create  BOOLEAN NOT NULL DEFAULT FALSE,
+  can_read    BOOLEAN NOT NULL DEFAULT FALSE,
+  can_update  BOOLEAN NOT NULL DEFAULT FALSE,
+  can_delete  BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, module)
+);
+CREATE INDEX IF NOT EXISTS idx_user_permissions_user ON user_permissions(user_id);
+
 -- ─────────────────────────────────────────────────────────────
 -- ACTIVITY / AUDIT LOG  (PRD §4.1)
 -- ─────────────────────────────────────────────────────────────

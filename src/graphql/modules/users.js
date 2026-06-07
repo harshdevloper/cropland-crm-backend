@@ -66,6 +66,16 @@ export const userTypeDefs = /* GraphQL */ `
     canDelete: Boolean!
   }
 
+  type UserPermission {
+    userId: ID!
+    module: String!
+    canCreate: Boolean!
+    canRead: Boolean!
+    canUpdate: Boolean!
+    canDelete: Boolean!
+    isOverride: Boolean!   # true if explicitly set for this user (overrides role)
+  }
+
   type RoleCount {
     role: UserRole!
     count: Int!
@@ -124,6 +134,7 @@ export const userTypeDefs = /* GraphQL */ `
     userStats: UserStats!
     branches: [Branch!]!
     rolePermissions(role: UserRole): [RolePermission!]!
+    userPermissions(userId: ID!): [UserPermission!]!
   }
 
   extend type Mutation {
@@ -143,6 +154,15 @@ export const userTypeDefs = /* GraphQL */ `
       canUpdate: Boolean!
       canDelete: Boolean!
     ): RolePermission!
+    setUserPermission(
+      userId: ID!
+      module: String!
+      canCreate: Boolean!
+      canRead: Boolean!
+      canUpdate: Boolean!
+      canDelete: Boolean!
+    ): UserPermission!
+    resetUserPermissions(userId: ID!): Boolean!
   }
 `;
 
@@ -187,6 +207,16 @@ const mapPerm = (r) => ({
   canRead: r.can_read,
   canUpdate: r.can_update,
   canDelete: r.can_delete,
+});
+
+const mapUserPerm = (userId, module, src, isOverride) => ({
+  userId,
+  module,
+  canCreate: src.can_create,
+  canRead: src.can_read,
+  canUpdate: src.can_update,
+  canDelete: src.can_delete,
+  isOverride,
 });
 
 function issueTokens(app, user) {
@@ -267,6 +297,23 @@ export function userResolvers(app) {
           [role ?? null],
         );
         return rows.map(mapPerm);
+      },
+      // Effective per-module permissions for one user: their explicit override
+      // where present, otherwise the default for their role.
+      userPermissions: async (_p, { userId }, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const u = (await query('SELECT role FROM users WHERE id = $1', [userId])).rows[0];
+        if (!u) throw httpError('User not found', 404);
+        const roleRows = (await query(
+          'SELECT * FROM role_permissions WHERE role = $1::user_role ORDER BY module',
+          [u.role],
+        )).rows;
+        const overrides = (await query('SELECT * FROM user_permissions WHERE user_id = $1', [userId])).rows;
+        const ovMap = new Map(overrides.map((r) => [r.module, r]));
+        return roleRows.map((rp) => {
+          const ov = ovMap.get(rp.module);
+          return mapUserPerm(userId, rp.module, ov ?? rp, Boolean(ov));
+        });
       },
     },
 
@@ -399,6 +446,29 @@ export function userResolvers(app) {
         );
         await logActivity(actor.sub, 'SET_PERMISSION', 'role_permission', rows[0].id, { role, module });
         return mapPerm(rows[0]);
+      },
+      setUserPermission: async (_p, args, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const { userId, module, canCreate, canRead, canUpdate, canDelete } = args;
+        if (!(await query('SELECT 1 FROM users WHERE id = $1', [userId])).rows[0]) throw httpError('User not found', 404);
+        const { rows } = await query(
+          `INSERT INTO user_permissions (user_id, module, can_create, can_read, can_update, can_delete)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (user_id, module) DO UPDATE SET
+             can_create=EXCLUDED.can_create, can_read=EXCLUDED.can_read,
+             can_update=EXCLUDED.can_update, can_delete=EXCLUDED.can_delete, updated_at=now()
+           RETURNING *`,
+          [userId, module, canCreate, canRead, canUpdate, canDelete],
+        );
+        await logActivity(actor.sub, 'SET_USER_PERMISSION', 'user_permission', rows[0].id, { userId, module });
+        return mapUserPerm(userId, module, rows[0], true);
+      },
+      // Clears all overrides for a user, reverting them to their role defaults.
+      resetUserPermissions: async (_p, { userId }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        await query('DELETE FROM user_permissions WHERE user_id = $1', [userId]);
+        await logActivity(actor.sub, 'RESET_USER_PERMISSIONS', 'user', userId);
+        return true;
       },
     },
 
