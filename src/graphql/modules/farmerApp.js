@@ -47,6 +47,18 @@ export const farmerAppTypeDefs = /* GraphQL */ `
   type AppComplaint { id: ID!, ticketNo: String!, category: String!, description: String!, status: String!, priority: String, resolutionNote: String, createdAt: DateTime!, events: [AppComplaintEvent!]! }
   type AccountSummary { totalPurchased: Float!, totalPaid: Float!, balance: Float! }
   type AppOrder { id: ID!, orderNo: String!, billType: String!, status: String!, orderDate: String!, totalAmount: Float!, itemCount: Int! }
+  type AppPurchaseLine { productName: String!, quantity: Float!, unitPrice: Float!, lineTotal: Float!, uom: String }
+  type AppPurchase {
+    id: ID!
+    refNo: String!
+    kind: String!          # ORDER / DIRECT
+    date: String!
+    status: String
+    totalAmount: Float!
+    amountPaid: Float!
+    balanceDue: Float!
+    items: [AppPurchaseLine!]!
+  }
   type AppProduct { id: ID!, name: String!, category: String, technicalName: String, uom: String, packingSize: String, mrp: Float, imageUrl: String, recommendedDosage: String, applicationFrequency: String, targetCrops: [String!]!, targetDiseases: [String!]! }
   type AppNotification { id: ID!, title: String!, body: String!, campaignType: String, createdAt: DateTime! }
   type AppDiagnosis { id: ID!, sessionNo: String!, crop: String!, detectedDisease: String, pathogen: String, confidence: Float, severity: String, symptoms: String, recommendation: String, source: String, products: [String!]!, imageUrl: String, createdAt: DateTime! }
@@ -61,6 +73,7 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     myAdvisories: [AppAdvisory!]!
     myComplaints: [AppComplaint!]!
     myOrders: [AppOrder!]!
+    myPurchases: [AppPurchase!]!
     myDiagnoses: [AppDiagnosis!]!
     myNotifications(limit: Int = 50): [AppNotification!]!
     appProducts(search: String, limit: Int = 100): [AppProduct!]!
@@ -173,6 +186,40 @@ export function farmerAppResolvers(app) {
           [id],
         );
         return rows.map((r) => ({ id: r.id, orderNo: r.order_no, billType: r.bill_type ?? 'GST', status: r.status, orderDate: isoDate(r.order_date), totalAmount: num(r.total_amount), itemCount: r.item_count }));
+      },
+      // Unified purchase history: GST/Non-GST orders + direct sales, each with its
+      // product line items and payment status. Powers the Purchases screen and the
+      // per-product transaction sheet in the farmer app.
+      myPurchases: async (_p, _a, ctx) => {
+        const id = farmerId(ctx);
+        const round2 = (n) => Math.round(n * 100) / 100;
+        const mapLine = (l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), lineTotal: num(l.line_total), uom: l.uom ?? null });
+        const out = [];
+
+        const orders = (await query(
+          `SELECT o.id, o.order_no, o.order_date, o.status, o.total_amount,
+                  COALESCE((SELECT SUM(amount_paid) FROM invoices i WHERE i.order_id = o.id), 0) paid
+           FROM orders o WHERE o.farmer_id = $1 ORDER BY o.created_at DESC`,
+          [id],
+        )).rows;
+        for (const o of orders) {
+          const lines = (await query('SELECT product_name, quantity, unit_price, line_total, uom FROM order_lines WHERE order_id = $1', [o.id])).rows;
+          const total = num(o.total_amount), paid = num(o.paid);
+          out.push({ id: o.id, refNo: o.order_no, kind: 'ORDER', date: isoDate(o.order_date), status: o.status, totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: lines.map(mapLine) });
+        }
+
+        const sales = (await query(
+          'SELECT id, sale_no, sale_date, total_amount, amount_paid FROM party_sales WHERE farmer_id = $1 ORDER BY created_at DESC',
+          [id],
+        )).rows;
+        for (const s of sales) {
+          const lines = (await query('SELECT product_name, quantity, unit_price, line_total FROM party_sale_lines WHERE sale_id = $1', [s.id])).rows;
+          const total = num(s.total_amount), paid = num(s.amount_paid);
+          out.push({ id: s.id, refNo: s.sale_no, kind: 'DIRECT', date: isoDate(s.sale_date), status: paid >= total ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'DUE'), totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: lines.map(mapLine) });
+        }
+
+        out.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+        return out;
       },
       myDiagnoses: async (_p, _a, ctx) => {
         const id = farmerId(ctx);
