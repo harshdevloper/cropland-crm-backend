@@ -5,7 +5,7 @@
 // Reuses the same `distributors` table the admin panel manages, so an
 // admin-created distributor and an app login are one and the same record.
 
-import { query } from '../../db/index.js';
+import { query, withTransaction } from '../../db/index.js';
 import { assertAuth } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
 import { getWeather, weatherConfigured } from '../../services/weather/index.js';
@@ -68,6 +68,42 @@ export const distributorAppTypeDefs = /* GraphQL */ `
   # Farmer lookup before honoring a coin redemption (shows balance + name).
   type DistFarmerLookup { id: ID!, farmerCode: String!, name: String!, village: String, phone: String, pointsBalance: Int! }
 
+  # A bill the distributor raised to a farmer/buyer (their own resale).
+  type DistSaleLine { productName: String!, quantity: Float!, unitPrice: Float!, gstPercent: Float!, lineTotal: Float! }
+  type DistSale {
+    id: ID!
+    billNo: String!
+    buyerName: String!
+    buyerPhone: String
+    farmerCode: String
+    billType: String!
+    saleDate: String!
+    subTotal: Float!
+    taxTotal: Float!
+    totalAmount: Float!
+    amountPaid: Float!
+    balanceDue: Float!
+    paymentMethod: String
+    notes: String
+    items: [DistSaleLine!]!
+    createdAt: DateTime!
+  }
+  type DistSaleStats { totalSold: Float!, totalPaid: Float!, outstanding: Float!, count: Int! }
+
+  extend type AppProduct { gstPercent: Float }
+
+  input DistSaleLineInput { productId: ID, productName: String, quantity: Float!, unitPrice: Float!, gstPercent: Float }
+  input DistCreateSaleInput {
+    farmerCode: String        # optional — bill an existing (admin-created) farmer
+    buyerName: String         # required when no farmerCode (walk-in buyer)
+    buyerPhone: String
+    billType: String = "GST"  # GST / NON_GST
+    amountPaid: Float = 0
+    paymentMethod: String
+    notes: String
+    lines: [DistSaleLineInput!]!
+  }
+
   extend type Query {
     meDistributor: DistributorProfile
     distProducts(search: String, limit: Int = 100): [AppProduct!]!
@@ -76,6 +112,8 @@ export const distributorAppTypeDefs = /* GraphQL */ `
     distInvoiceStats: DistInvoiceStats!
     distDiagnoses: [AppDiagnosis!]!
     distFarmerLookup(farmerCode: String!): DistFarmerLookup!
+    distSales(search: String): [DistSale!]!
+    distSaleStats: DistSaleStats!
   }
 
   extend type Mutation {
@@ -83,8 +121,19 @@ export const distributorAppTypeDefs = /* GraphQL */ `
     updateMyDistributorProfile(language: String): DistributorProfile!
     registerMyDistributorDevice(fcmToken: String!): Boolean!
     distRunDiagnosis(crop: String!, imageUrl: String): AppDiagnosis!
+    distCreateSale(input: DistCreateSaleInput!): DistSale!
   }
 `;
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+const mapSale = (r) => r && {
+  id: r.id, billNo: r.bill_no, buyerName: r.buyer_name, buyerPhone: r.buyer_phone, farmerCode: r.farmer_code ?? null,
+  billType: r.bill_type ?? 'GST', saleDate: isoDate(r.sale_date), subTotal: num(r.sub_total) ?? 0, taxTotal: num(r.tax_total) ?? 0,
+  totalAmount: num(r.total_amount) ?? 0, amountPaid: num(r.amount_paid) ?? 0,
+  balanceDue: round2((num(r.total_amount) ?? 0) - (num(r.amount_paid) ?? 0)),
+  paymentMethod: r.payment_method, notes: r.notes, createdAt: r.created_at,
+};
 
 const mapProfile = (r) => r && {
   id: r.id, name: r.name, contactPerson: r.contact_person, phone: r.phone, email: r.email,
@@ -148,7 +197,7 @@ export function distributorAppResolvers(app) {
         return rows.map((r) => ({
           id: r.id, name: r.name, category: r.category, technicalName: r.technical_name, uom: r.uom, packingSize: r.packing_size,
           mrp: num(r.mrp), imageKey: r.image_key, recommendedDosage: r.recommended_dosage, applicationFrequency: r.application_frequency,
-          targetCrops: r.target_crops ?? [], targetDiseases: r.target_diseases ?? [],
+          targetCrops: r.target_crops ?? [], targetDiseases: r.target_diseases ?? [], gstPercent: num(r.gst_percent),
         }));
       },
 
@@ -221,6 +270,30 @@ export function distributorAppResolvers(app) {
         if (!f) throw httpError('No farmer with that reference code', 404);
         return { id: f.id, farmerCode: f.farmer_code, name: f.name, village: f.village, phone: f.phone, pointsBalance: f.points_balance ?? 0 };
       },
+
+      // Bills the distributor has raised to farmers/buyers, newest first (optional search).
+      distSales: async (_p, { search }, ctx) => {
+        const id = distributorId(ctx);
+        const { rows } = await query(
+          `SELECT s.*, f.farmer_code FROM distributor_sales s LEFT JOIN farmers f ON f.id = s.farmer_id
+           WHERE s.distributor_id = $1
+             AND ($2::text IS NULL OR s.bill_no ILIKE '%'||$2||'%' OR s.buyer_name ILIKE '%'||$2||'%' OR s.buyer_phone ILIKE '%'||$2||'%')
+           ORDER BY s.created_at DESC`,
+          [id, search && search.trim() ? search.trim() : null],
+        );
+        return rows.map(mapSale);
+      },
+
+      distSaleStats: async (_p, _a, ctx) => {
+        const id = distributorId(ctx);
+        const { rows } = await query(
+          `SELECT COALESCE(SUM(total_amount),0) total_sold, COALESCE(SUM(amount_paid),0) total_paid, COUNT(*)::int count
+           FROM distributor_sales WHERE distributor_id = $1`,
+          [id],
+        );
+        const sold = num(rows[0].total_sold) ?? 0, paid = num(rows[0].total_paid) ?? 0;
+        return { totalSold: sold, totalPaid: paid, outstanding: Math.round((sold - paid) * 100) / 100, count: rows[0].count };
+      },
     },
 
     Mutation: {
@@ -288,8 +361,72 @@ export function distributorAppResolvers(app) {
           source: r.source, products: await productNames(productIds), imageUrl: r.image_url, createdAt: r.created_at,
         };
       },
+
+      // The distributor raises a GST bill (or bill of supply) to a farmer/buyer.
+      // GST per line comes from the product's gst_percent; NON_GST zeroes tax.
+      distCreateSale: async (_p, { input }, ctx) => {
+        const id = distributorId(ctx);
+        if (!input.lines?.length) throw httpError('A bill needs at least one item', 400);
+        const billType = input.billType === 'NON_GST' ? 'NON_GST' : 'GST';
+
+        // Resolve the buyer: a known farmer (by code) or a walk-in name/phone.
+        let farmerId = null, buyerName = (input.buyerName ?? '').trim(), buyerPhone = (input.buyerPhone ?? '').trim() || null;
+        if (input.farmerCode && input.farmerCode.trim()) {
+          const f = (await query('SELECT id, name, phone FROM farmers WHERE farmer_code = $1', [input.farmerCode.trim()])).rows[0];
+          if (!f) throw httpError('No farmer with that reference code', 404);
+          farmerId = f.id; buyerName = f.name; buyerPhone = f.phone ?? buyerPhone;
+        }
+        if (!buyerName) throw httpError('Enter the buyer name (or a valid farmer code)', 400);
+
+        // Price each line; pull GST% from the product unless the client overrode it.
+        let subTotal = 0, taxTotal = 0;
+        const prepared = [];
+        for (const l of input.lines) {
+          if (!(l.quantity > 0)) throw httpError('Each item needs a quantity greater than 0', 400);
+          let name = (l.productName ?? '').trim();
+          let gst = l.gstPercent != null ? num(l.gstPercent) : 0;
+          if (l.productId) {
+            const p = (await query('SELECT name, gst_percent FROM products WHERE id = $1', [l.productId])).rows[0];
+            if (p) { name = name || p.name; if (l.gstPercent == null) gst = num(p.gst_percent) ?? 0; }
+          }
+          if (!name) throw httpError('Each item needs a product', 400);
+          const lineTotal = round2(l.quantity * l.unitPrice);
+          subTotal += lineTotal;
+          if (billType === 'GST') taxTotal += round2(lineTotal * gst / 100);
+          prepared.push({ productId: l.productId ?? null, name, quantity: l.quantity, unitPrice: l.unitPrice, gst: billType === 'GST' ? gst : 0, lineTotal });
+        }
+        subTotal = round2(subTotal); taxTotal = round2(taxTotal);
+        const total = round2(subTotal + taxTotal);
+        const paid = Math.min(round2(input.amountPaid ?? 0), total);
+
+        return withTransaction(async (client) => {
+          const billNo = `DSB-${String((await client.query("SELECT nextval('dist_sale_seq') n")).rows[0].n).padStart(5, '0')}`;
+          const sale = (await client.query(
+            `INSERT INTO distributor_sales (bill_no, distributor_id, farmer_id, buyer_name, buyer_phone, bill_type, sub_total, tax_total, total_amount, amount_paid, payment_method, notes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+            [billNo, id, farmerId, buyerName, buyerPhone, billType, subTotal, taxTotal, total, paid, input.paymentMethod ?? null, input.notes ?? null],
+          )).rows[0];
+          for (const p of prepared) {
+            await client.query(
+              `INSERT INTO distributor_sale_lines (sale_id, product_id, product_name, quantity, unit_price, gst_percent, line_total)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+              [sale.id, p.productId, p.name, p.quantity, p.unitPrice, p.gst, p.lineTotal],
+            );
+          }
+          await logActivity(null, 'DIST_CREATE_SALE', 'distributor_sale', sale.id, { billNo, via: 'distributor-app' });
+          const code = farmerId ? (await client.query('SELECT farmer_code FROM farmers WHERE id=$1', [farmerId])).rows[0]?.farmer_code : null;
+          return mapSale({ ...sale, farmer_code: code });
+        });
+      },
     },
 
     DistributorProfile: { photoUrl: (parent) => imgUrl(parent.photoKey) },
+    DistSale: {
+      items: async (parent) => {
+        const { rows } = await query('SELECT product_name, quantity, unit_price, gst_percent, line_total FROM distributor_sale_lines WHERE sale_id = $1 ORDER BY product_name', [parent.id]);
+        return rows.map((l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), gstPercent: num(l.gst_percent), lineTotal: num(l.line_total) }));
+      },
+    },
+    AppProduct: { gstPercent: (parent) => parent.gstPercent ?? null },
   };
 }

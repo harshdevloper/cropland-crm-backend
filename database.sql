@@ -1210,6 +1210,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_distributors_email_lower ON distributors (
 ALTER TABLE crop_diagnoses ADD COLUMN IF NOT EXISTS distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_diag_distributor ON crop_diagnoses(distributor_id, created_at DESC);
 
+-- Distributor App: bills a distributor raises to farmers (their own resale / point-of-sale).
+-- Self-contained — does NOT touch company warehouse stock or company receivables.
+CREATE SEQUENCE IF NOT EXISTS dist_sale_seq START 1;
+CREATE TABLE IF NOT EXISTS distributor_sales (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  bill_no        TEXT UNIQUE NOT NULL,
+  distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE CASCADE,  -- the seller
+  farmer_id      UUID REFERENCES farmers(id) ON DELETE SET NULL,               -- buyer (if a known farmer)
+  buyer_name     TEXT NOT NULL,
+  buyer_phone    TEXT,
+  bill_type      TEXT NOT NULL DEFAULT 'GST',   -- GST (tax invoice) / NON_GST (bill of supply)
+  sale_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+  sub_total      NUMERIC(14,2) NOT NULL DEFAULT 0,
+  tax_total      NUMERIC(14,2) NOT NULL DEFAULT 0,
+  total_amount   NUMERIC(14,2) NOT NULL DEFAULT 0,
+  amount_paid    NUMERIC(14,2) NOT NULL DEFAULT 0,
+  payment_method TEXT,
+  notes          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_distsale_distributor ON distributor_sales(distributor_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS distributor_sale_lines (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sale_id      UUID NOT NULL REFERENCES distributor_sales(id) ON DELETE CASCADE,
+  product_id   UUID REFERENCES products(id) ON DELETE SET NULL,
+  product_name TEXT NOT NULL,
+  quantity     NUMERIC(14,2) NOT NULL CHECK (quantity > 0),
+  unit_price   NUMERIC(12,2) NOT NULL,
+  gst_percent  NUMERIC(5,2) NOT NULL DEFAULT 0,
+  line_total   NUMERIC(14,2) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_distsale_lines ON distributor_sale_lines(sale_id);
+
 -- ============================================================================
 -- End of schema (… + geo/enquiries + loyalty redemption + distributor app)
 -- ============================================================================
