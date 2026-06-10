@@ -11,6 +11,45 @@ export const aiConfigured = Boolean(KEY);
 
 const GEMINI = 'https://generativelanguage.googleapis.com/v1beta/models';
 
+// Map an upstream AI HTTP status to a clean, farmer-friendly message (no vendor
+// name leaked to the UI). 429 = daily/again-later quota; 4xx = key/config.
+function aiError(status) {
+  if (status === 429) return new Error('AI service is busy right now (daily limit reached). Please try again later.');
+  if (status === 401 || status === 403) return new Error('AI service is not available right now. Please try again later.');
+  if (status >= 500) return new Error('AI service is temporarily unavailable. Please try again in a moment.');
+  return new Error('Could not complete AI diagnosis. Please try again.');
+}
+
+// Real-Gemini fallback chain: when the configured model's free-tier daily quota
+// is exhausted (429), transparently try the next real Gemini model that still has
+// quota. These are all genuine Gemini models — never a demo/mock result.
+const MODEL_CHAIN = [...new Set([MODEL, 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.0-flash'])];
+
+/**
+ * POST to Gemini generateContent. Tries each model in MODEL_CHAIN: on a 429
+ * (quota) it moves to the next model; on a transient 5xx it retries the same
+ * model once. Only throws a clean error if every real model is quota-blocked.
+ */
+async function aiFetch(_model, body) {
+  let lastStatus = 429;
+  for (const model of MODEL_CHAIN) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const res = await fetch(`${GEMINI}/${model}:generateContent?key=${KEY}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (res.ok) return res;
+      lastStatus = res.status;
+      if (res.status === 429) break;            // quota for this model → try next model
+      if (attempt === 0 && res.status >= 500) { // transient → retry same model once
+        await new Promise((r) => setTimeout(r, 1200));
+        continue;
+      }
+      throw aiError(res.status);                 // 4xx config/key error → surface now
+    }
+  }
+  throw aiError(lastStatus);                     // every real model is quota-blocked
+}
+
 // ── Mock knowledge base (seeded by crop+image so results are stable) ──────────
 const DISEASE_DB = {
   tomato: [
@@ -82,12 +121,9 @@ function mockAdvisory(crop, disease, type) {
 async function geminiJson(prompt, imageBase64, mime = 'image/jpeg') {
   const parts = [{ text: prompt }];
   if (imageBase64) parts.push({ inline_data: { mime_type: mime, data: imageBase64 } });
-  const res = await fetch(`${GEMINI}/${MODEL}:generateContent?key=${KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0.4 } }),
-  });
-  if (!res.ok) throw new Error(`Gemini ${res.status}`);
+  // Route through aiFetch so advisories use the same real-Gemini model fallback
+  // chain as diagnosis (survives a single model's daily quota cap).
+  const res = await aiFetch(MODEL, { contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0.4 } });
   const data = await res.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
   return JSON.parse(text);
@@ -165,13 +201,36 @@ export function cosineSim(a, b) {
 }
 
 /**
- * Detect crop disease/pest from a photo.
+ * Detect crop disease/pest from a photo or crop name alone.
  * `references` (from Train AI Doctor) are labelled example images injected as
  * multimodal few-shot context to ground the model on the company's own field data.
+ * When no image is provided, a text-only Gemini prompt is used so real AI
+ * results are returned even without a photo.
  */
 export async function diagnoseCrop({ crop, imageUrl, references = [], lang }) {
-  if (!aiConfigured || !imageUrl) return mockDiagnose(crop, imageUrl);
+  if (!aiConfigured) return mockDiagnose(crop, imageUrl);
   try {
+    const langLine = lang === 'hi' ? ' Write the "symptoms" and "recommendation" values in Hindi (Devanagari script); keep the JSON keys and disease/pathogen names in English.' : '';
+    const outputInstruction = `Respond as strict JSON with keys: disease (string), pathogen (string), confidence (number 0-100), severity ("LOW"|"MEDIUM"|"HIGH"), symptoms (string), recommendation (string, 2-3 sentences of agronomic control advice).${langLine}`;
+
+    if (!imageUrl) {
+      // Text-only diagnosis: ask Gemini for the most likely disease given the crop name.
+      const refContext = references.length
+        ? ` Known conditions in our system for this crop: ${references.slice(0, 4).map((r) => r.disease).filter(Boolean).join(', ')}.`
+        : '';
+      const prompt = `You are an expert agronomy plant-pathologist. A farmer reports a problem with their ${crop} crop but has not provided a photo.${refContext} Based on common diseases affecting ${crop} in Indian agro-climatic conditions, diagnose the most likely disease or pest. ${outputInstruction}`;
+      const res = await aiFetch(MODEL, { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.5 } });
+      const data = await res.json();
+      const j = JSON.parse(data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}');
+      return {
+        disease: j.disease ?? 'Unknown', pathogen: j.pathogen ?? null,
+        confidence: Number(j.confidence) || 0, severity: SEVERITIES.includes(j.severity) ? j.severity : 'MEDIUM',
+        symptoms: j.symptoms ?? null, recommendation: j.recommendation ?? null,
+        source: 'gemini-text',
+      };
+    }
+
+    // Vision diagnosis: use the uploaded photo with optional few-shot reference images.
     const queryImg = await toInlineData(imageUrl);
     const parts = [];
     let usedRefs = 0;
@@ -186,15 +245,10 @@ export async function diagnoseCrop({ crop, imageUrl, references = [], lang }) {
         } catch { /* skip unreadable reference */ }
       }
     }
-    const langLine = lang === 'hi' ? ' Write the "symptoms" and "recommendation" values in Hindi (Devanagari script); keep the JSON keys and disease/pathogen names in English.' : '';
-    parts.push({ text: `Now diagnose THIS image of a ${crop} crop. Prefer a matching reference condition when applicable. Respond as strict JSON with keys: disease (string), pathogen (string), confidence (number 0-100), severity ("LOW"|"MEDIUM"|"HIGH"), symptoms (string), recommendation (string, 2-3 sentences of agronomic control advice).${langLine}` });
+    parts.push({ text: `Now diagnose THIS image of a ${crop} crop. Prefer a matching reference condition when applicable. ${outputInstruction}` });
     parts.push({ inline_data: { mime_type: queryImg.mime, data: queryImg.base64 } });
 
-    const res = await fetch(`${GEMINI}/${MODEL}:generateContent?key=${KEY}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0.4 } }),
-    });
-    if (!res.ok) throw new Error(`Gemini ${res.status}`);
+    const res = await aiFetch(MODEL, { contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0.4 } });
     const data = await res.json();
     const j = JSON.parse(data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}');
     return {
@@ -203,21 +257,17 @@ export async function diagnoseCrop({ crop, imageUrl, references = [], lang }) {
       symptoms: j.symptoms ?? null, recommendation: j.recommendation ?? null,
       source: usedRefs ? `gemini+${usedRefs}ref` : 'gemini',
     };
-  } catch {
-    return mockDiagnose(crop, imageUrl); // graceful fallback on any API/parse error
+  } catch (err) {
+    throw new Error(err?.message ?? 'AI diagnosis failed — please try again.');
   }
 }
 
-/** Generate a preventive/curative advisory for a crop+disease. */
+/** Generate a preventive/curative advisory for a crop+disease — real Gemini only. */
 export async function generateAdvisory({ crop, disease, type }) {
-  if (!aiConfigured) return mockAdvisory(crop, disease, type);
-  try {
-    const prompt = `Write a concise ${type === 'PREVENTIVE' ? 'preventive' : 'curative'} agronomic advisory for ${disease || 'crop health'} affecting ${crop}, for a smallholder Indian farmer. Respond as strict JSON: { "title": string, "body": string (numbered, actionable, mention spray schedule and safety) }.`;
-    const j = await geminiJson(prompt, null);
-    return { title: j.title ?? `Advisory for ${crop}`, body: j.body ?? '', source: 'gemini' };
-  } catch {
-    return mockAdvisory(crop, disease, type);
-  }
+  if (!aiConfigured) throw new Error('AI service is not configured. Please try again later.');
+  const prompt = `Write a concise ${type === 'PREVENTIVE' ? 'preventive' : 'curative'} agronomic advisory for ${disease || 'crop health'} affecting ${crop}, for a smallholder Indian farmer. Respond as strict JSON: { "title": string, "body": string (numbered, actionable, mention spray schedule and safety) }.`;
+  const j = await geminiJson(prompt, null);
+  return { title: j.title ?? `Advisory for ${crop}`, body: j.body ?? '', source: 'gemini' };
 }
 
 export function aiChannelStatus() {

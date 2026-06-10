@@ -8,6 +8,7 @@ import { httpError, logActivity, num, isoDate } from '../helpers.js';
 import { diagnoseCrop, generateAdvisory as genAdvisory, aiChannelStatus, embedSample, cosineSim } from '../../services/ai/index.js';
 import { upsertSample, deleteSamples, querySimilar, vectorStoreStatus, pineconeConfigured } from '../../services/ai/pinecone.js';
 import { sendEmail } from '../../services/notify/email.js';
+import { sendPush } from '../../services/notify/push.js';
 
 export const aiTypeDefs = /* GraphQL */ `
   type ProductRef { id: ID!, name: String! }
@@ -104,6 +105,17 @@ export const aiTypeDefs = /* GraphQL */ `
   input TrainingClassInput { crop: String!, disease: String!, pathogen: String, description: String, symptoms: String, treatment: String, productIds: [ID!] }
   input TrainingSampleInput { imageUrl: String!, imageKey: String, caption: String }
 
+  type CropDiagnosesPage {
+    items: [CropDiagnosis!]!
+    total: Int!
+    totalAll: Int!
+    totalHigh: Int!
+    totalMedium: Int!
+    totalLow: Int!
+    page: Int!
+    pageSize: Int!
+  }
+
   type NameCount { label: String!, count: Int! }
   type DistrictDisease { district: String!, disease: String!, count: Int! }
   type AiAnalytics {
@@ -130,7 +142,7 @@ export const aiTypeDefs = /* GraphQL */ `
   input UpdateAdvisoryInput { crop: String!, disease: String, type: String!, title: String!, body: String!, farmerId: ID }
 
   extend type Query {
-    cropDiagnoses(search: String, limit: Int = 100): [CropDiagnosis!]!
+    cropDiagnoses(search: String, severity: String, page: Int = 1, pageSize: Int = 20): CropDiagnosesPage!
     cropDiagnosis(id: ID!): CropDiagnosis
     advisories(status: String, limit: Int = 100): [Advisory!]!
     crmLeads(status: String, limit: Int = 100): [CrmLead!]!
@@ -286,15 +298,63 @@ const seq = async (name) => (await query(`SELECT nextval('${name}') n`)).rows[0]
 export function aiResolvers() {
   return {
     Query: {
-      cropDiagnoses: async (_p, { search, limit }, ctx) => {
+      cropDiagnoses: async (_p, { search, severity, page, pageSize }, ctx) => {
         assertAuth(ctx);
-        const { rows } = await query(
-          `SELECT d.*, f.name farmer_name FROM crop_diagnoses d LEFT JOIN farmers f ON f.id = d.farmer_id
-           WHERE ($1::text IS NULL OR d.crop ILIKE '%'||$1||'%' OR d.detected_disease ILIKE '%'||$1||'%' OR d.session_no ILIKE '%'||$1||'%')
-           ORDER BY d.created_at DESC LIMIT $2`,
-          [search ?? null, limit],
-        );
-        return rows.map(mapDiag);
+        const offset = (page - 1) * pageSize;
+        const sevFilter = severity && severity !== 'ALL' ? severity : null;
+        const searchTerm = search ?? null;
+
+        const [dataRes, countRes] = await Promise.all([
+          query(
+            `SELECT d.*, f.name farmer_name
+             FROM crop_diagnoses d
+             LEFT JOIN farmers f ON f.id = d.farmer_id
+             WHERE ($1::text IS NULL
+                    OR d.crop ILIKE '%'||$1||'%'
+                    OR d.detected_disease ILIKE '%'||$1||'%'
+                    OR d.session_no ILIKE '%'||$1||'%'
+                    OR f.name ILIKE '%'||$1||'%')
+               AND ($2::text IS NULL OR d.severity = $2)
+             ORDER BY d.created_at DESC LIMIT $3 OFFSET $4`,
+            [searchTerm, sevFilter, pageSize, offset],
+          ),
+          query(
+            `SELECT
+               COUNT(*)::int                                          AS total_all,
+               COUNT(*) FILTER (WHERE d.severity = 'HIGH')::int      AS total_high,
+               COUNT(*) FILTER (WHERE d.severity = 'MEDIUM')::int    AS total_medium,
+               COUNT(*) FILTER (WHERE d.severity = 'LOW')::int       AS total_low
+             FROM crop_diagnoses d
+             LEFT JOIN farmers f ON f.id = d.farmer_id
+             WHERE ($1::text IS NULL
+                    OR d.crop ILIKE '%'||$1||'%'
+                    OR d.detected_disease ILIKE '%'||$1||'%'
+                    OR d.session_no ILIKE '%'||$1||'%'
+                    OR f.name ILIKE '%'||$1||'%')`,
+            [searchTerm],
+          ),
+        ]);
+
+        const c = countRes.rows[0];
+        const totalAll = Number(c.total_all);
+        const totalHigh = Number(c.total_high);
+        const totalMedium = Number(c.total_medium);
+        const totalLow = Number(c.total_low);
+        const total = sevFilter === 'HIGH' ? totalHigh
+          : sevFilter === 'MEDIUM' ? totalMedium
+          : sevFilter === 'LOW' ? totalLow
+          : totalAll;
+
+        return {
+          items: dataRes.rows.map(mapDiag),
+          total,
+          totalAll,
+          totalHigh,
+          totalMedium,
+          totalLow,
+          page,
+          pageSize,
+        };
       },
       cropDiagnosis: async (_p, { id }, ctx) => {
         assertAuth(ctx);
@@ -562,7 +622,10 @@ export function aiResolvers() {
 
       sendAdvisory: async (_p, { id }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const adv = (await query('SELECT a.*, f.email farmer_email, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id=a.farmer_id WHERE a.id=$1', [id])).rows[0];
+        const adv = (await query(
+          'SELECT a.*, f.email farmer_email, f.name farmer_name, f.fcm_token farmer_fcm_token FROM advisories a LEFT JOIN farmers f ON f.id=a.farmer_id WHERE a.id=$1',
+          [id],
+        )).rows[0];
         if (!adv) throw httpError('Advisory not found', 404);
         if (adv.farmer_email) {
           const text = `Dear ${adv.farmer_name ?? 'Farmer'},\n\n${adv.body}\n\nRegards,\nCropland Agritech India`;
@@ -570,6 +633,24 @@ export function aiResolvers() {
         }
         await query("UPDATE advisories SET status='SENT', sent_at=now() WHERE id=$1", [id]);
         await logActivity(a.sub, 'SEND_ADVISORY', 'advisory', id);
+
+        // FCM push notification (non-blocking — don't fail the mutation if push fails)
+        try {
+          let fcmTokens;
+          if (adv.farmer_id) {
+            // Farmer-specific advisory: push to that farmer's device
+            fcmTokens = [adv.farmer_fcm_token].filter(Boolean);
+          } else {
+            // Broadcast advisory: push to all app-linked farmers
+            const { rows: linked } = await query('SELECT fcm_token FROM farmers WHERE fcm_token IS NOT NULL');
+            fcmTokens = linked.map((r) => r.fcm_token);
+          }
+          if (fcmTokens.length) {
+            const bodyExcerpt = (adv.body ?? '').slice(0, 120);
+            await sendPush(fcmTokens, adv.title, bodyExcerpt, { type: 'advisory', advisoryId: String(adv.id) });
+          }
+        } catch (_) { /* push failure is non-blocking */ }
+
         const full = await query('SELECT a.*, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id=a.farmer_id WHERE a.id=$1', [id]);
         return mapAdvisory(full.rows[0]);
       },

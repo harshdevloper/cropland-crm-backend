@@ -123,6 +123,7 @@ export const orderTypeDefs = /* GraphQL */ `
     orderDate: String
     notes: String
     deliveryAddress: String
+    discountAmount: Float = 0   # bill-level discount in ₹ (UI offers % or ₹; resolved to ₹ here)
     lines: [OrderLineInput!]!
   }
 
@@ -329,7 +330,6 @@ export function orderResolvers() {
           // Snapshot product data + compute line totals. Non-GST orders carry no tax.
           // Farmers (B2C) are billed at MRP/dealer price; distributors at the distributor price.
           let subTotal = 0;
-          let taxTotal = 0;
           const lines = [];
           for (const l of input.lines) {
             const pr = await client.query('SELECT * FROM products WHERE id = $1', [l.productId]);
@@ -343,21 +343,26 @@ export function orderResolvers() {
             const lineTotal = round2(l.quantity * unitPrice * (1 - disc / 100));
             const gst = billType === 'GST' ? num(p.gst_percent ?? 0) : 0;
             subTotal += lineTotal;
-            taxTotal += round2((lineTotal * gst) / 100);
             lines.push({ p, l, unitPrice, disc, lineTotal, gst });
           }
           subTotal = round2(subTotal);
+          // Bill-level discount (₹). Clamp to [0, subTotal]; spread proportionally so
+          // per-line GST stays correct (tax is charged on the post-discount value).
+          const discountTotal = round2(Math.min(Math.max(num(input.discountAmount) || 0, 0), subTotal));
+          const factor = subTotal > 0 ? (subTotal - discountTotal) / subTotal : 1;
+          let taxTotal = 0;
+          for (const ln of lines) taxTotal += round2((ln.lineTotal * factor * ln.gst) / 100);
           taxTotal = round2(taxTotal);
-          const total = round2(subTotal + taxTotal);
+          const total = round2(subTotal - discountTotal + taxTotal);
 
           const orderNo = `ORD-${financialYear(input.orderDate)}-${String(
             (await client.query("SELECT nextval('order_seq') AS n")).rows[0].n,
           ).padStart(5, '0')}`;
 
           const ord = await client.query(
-            `INSERT INTO orders (order_no, distributor_id, farmer_id, customer_type, farmer_ref, bill_type, status, order_date, sub_total, tax_total, total_amount, notes, delivery_address, created_by)
-             VALUES ($1,$2,$3,$4,$5,$6,'PLACED',COALESCE($7,CURRENT_DATE),$8,$9,$10,$11,$12,$13) RETURNING *`,
-            [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, input.orderDate ?? null, subTotal, taxTotal, total, input.notes ?? null, input.deliveryAddress ?? null, actor.sub],
+            `INSERT INTO orders (order_no, distributor_id, farmer_id, customer_type, farmer_ref, bill_type, status, order_date, sub_total, discount_total, tax_total, total_amount, notes, delivery_address, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,'PLACED',COALESCE($7,CURRENT_DATE),$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+            [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, input.orderDate ?? null, subTotal, discountTotal, taxTotal, total, input.notes ?? null, input.deliveryAddress ?? null, actor.sub],
           );
           const orderId = ord.rows[0].id;
 
@@ -455,7 +460,8 @@ export function orderResolvers() {
             }
           }
 
-          const taxable = num(order.sub_total);
+          // Taxable value is net of any bill-level discount recorded on the order.
+          const taxable = round2(num(order.sub_total) - num(order.discount_total));
           let cgst = 0;
           let sgst = 0;
           let igst = 0;

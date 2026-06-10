@@ -136,7 +136,8 @@ async function matchProductsForApp(crop, disease) {
 }
 
 export function farmerAppResolvers(app) {
-  const sign = (farmer) => app.jwt.sign({ sub: farmer.id, kind: 'FARMER', role: 'FARMER' });
+  // Mobile apps need long-lived tokens; 30-day expiry replaces the default 15-min access window.
+  const sign = (farmer) => app.jwt.sign({ sub: farmer.id, kind: 'FARMER', role: 'FARMER' }, { expiresIn: '30d' });
   const authPayload = (farmer) => ({ token: sign(farmer), farmer: mapFarmer(farmer) });
 
   return {
@@ -232,9 +233,16 @@ export function farmerAppResolvers(app) {
       },
       myNotifications: async (_p, { limit }, ctx) => {
         const id = farmerId(ctx);
+        // Unified feed: admin notifications + the farmer's advisories (so the bell
+        // shows advisories too), newest first.
         const { rows } = await query(
-          `SELECT id, title, body, campaign_type, created_at FROM notifications
-           WHERE status = 'SENT' AND (target_farmer_id = $1 OR audience IN ('FARMERS','ALL'))
+          `SELECT id, title, body, campaign_type, created_at FROM (
+             SELECT id, title, body, campaign_type, created_at FROM notifications
+               WHERE status = 'SENT' AND (target_farmer_id = $1 OR audience IN ('FARMERS','ALL'))
+             UNION ALL
+             SELECT id, title, body, 'ADVISORY' AS campaign_type, created_at FROM advisories
+               WHERE status IN ('SENT','READ') AND (farmer_id = $1 OR farmer_id IS NULL)
+           ) feed
            ORDER BY created_at DESC LIMIT $2`,
           [id, limit],
         );
@@ -420,6 +428,7 @@ export function farmerAppResolvers(app) {
 
       markAdvisoryRead: async (_p, { id }, ctx) => {
         const fid = farmerId(ctx);
+        // Farmer-specific advisories: mark as READ. Broadcast (farmer_id IS NULL) stay SENT — shared record, not personal.
         await query("UPDATE advisories SET status='READ' WHERE id=$1 AND farmer_id=$2 AND status='SENT'", [id, fid]);
         return true;
       },

@@ -41,18 +41,22 @@ async function getMessaging() {
   return messaging;
 }
 
-/** Send a push notification to many device tokens. Returns a dispatch summary. */
-export async function sendPush(tokens, title, body) {
+/** Send a push notification to many device tokens. Returns a dispatch summary.
+ *  extraData — optional key/value pairs merged into the FCM data payload (all values stringified). */
+export async function sendPush(tokens, title, body, extraData = {}) {
   const list = [...new Set((tokens || []).filter(Boolean))];
   if (!list.length) return { channel: 'PUSH', sent: 0, note: 'no device tokens' };
   const m = await getMessaging();
   if (!m) return { channel: 'PUSH', sent: 0, skipped: true, note: 'FCM not configured' };
+  // All FCM data values must be strings.
+  const data = { title: String(title ?? ''), body: String(body ?? '') };
+  for (const [k, v] of Object.entries(extraData)) data[k] = String(v ?? '');
   const res = await m.sendEachForMulticast({
     tokens: list,
     notification: { title, body },
     // Mirror into data so the Farmer App's foreground onMessage handler fires
     // (a notification-only payload is swallowed by the OS on some Android OEMs).
-    data: { title: String(title ?? ''), body: String(body ?? '') },
+    data,
   });
   return { channel: 'PUSH', sent: res.successCount, failed: res.failureCount };
 }

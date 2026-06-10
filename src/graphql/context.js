@@ -13,23 +13,16 @@ export async function buildContext(request) {
   return { user, log: request.log };
 }
 
-/** Throw a GraphQL-friendly error if the request is unauthenticated. */
+/** Throw a GraphQL-friendly error if the request is unauthenticated.
+ *  No statusCode — keeps HTTP 200 so graphql_flutter parses errors correctly. */
 export function assertAuth(context) {
-  if (!context.user) {
-    const err = new Error('Unauthorized');
-    err.statusCode = 401;
-    throw err;
-  }
+  if (!context.user) throw new Error('Unauthorized');
   return context.user;
 }
 
 /** Throw if the authenticated user is not in `roles`. */
 export function assertRole(context, ...roles) {
   const user = assertAuth(context);
-  if (!roles.includes(user.role)) {
-    const err = new Error('Forbidden: insufficient role');
-    err.statusCode = 403;
-    throw err;
-  }
+  if (!roles.includes(user.role)) throw new Error('Forbidden: insufficient role');
   return user;
 }
