@@ -26,6 +26,7 @@ import { partyResolvers } from './modules/parties.js';
 import { forecastResolvers } from './modules/forecast.js';
 import { whatsappResolvers } from './modules/whatsapp.js';
 import { farmerAppResolvers } from './modules/farmerApp.js';
+import { distributorAppResolvers } from './modules/distributorApp.js';
 import { enquiryResolvers } from './modules/enquiries.js';
 import { redemptionResolvers } from './modules/redemptions.js';
 import { translateResolvers } from './modules/translate.js';
@@ -99,6 +100,7 @@ export function buildResolvers(app) {
     forecastResolvers(app),
     whatsappResolvers(app),
     farmerAppResolvers(app),
+    distributorAppResolvers(app),
     enquiryResolvers(app),
     redemptionResolvers(app),
     translateResolvers(app),

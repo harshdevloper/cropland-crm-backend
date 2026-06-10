@@ -34,6 +34,8 @@ export const redemptionTypeDefs = /* GraphQL */ `
     redemptionStats: RedemptionStats!
     distributorSettlements: [DistributorSettlement!]!
     myRedemptions: [Redemption!]!
+    # Distributor App: coins this distributor has honored for farmers, newest first.
+    distRedemptions: [Redemption!]!
   }
 
   extend type Mutation {
@@ -41,6 +43,8 @@ export const redemptionTypeDefs = /* GraphQL */ `
     redeemForFarmer(farmerCode: String!, points: Int!, distributorId: ID, note: String): Redemption!
     # Farmer self-redeem from the app (company-honored).
     createMyRedemption(points: Int!, note: String): Redemption!
+    # Distributor App: the logged-in distributor honors a farmer's coins (extra discount).
+    distRedeemFarmerCoins(farmerCode: String!, points: Int!, note: String): Redemption!
     settleDistributor(distributorId: ID!): Int!
     markRedemptionSettled(id: ID!, settled: Boolean!): Redemption!
   }
@@ -115,6 +119,12 @@ export function redemptionResolvers() {
         const { rows } = await query(`${SELECT} WHERE r.farmer_id=$1 ORDER BY r.created_at DESC`, [u.sub]);
         return rows.map(map);
       },
+      distRedemptions: async (_p, _a, ctx) => {
+        const u = assertAuth(ctx);
+        if (u.kind !== 'DISTRIBUTOR') throw httpError('Distributor authentication required', 403);
+        const { rows } = await query(`${SELECT} WHERE r.distributor_id=$1 ORDER BY r.created_at DESC`, [u.sub]);
+        return rows.map(map);
+      },
     },
 
     Mutation: {
@@ -132,6 +142,15 @@ export function redemptionResolvers() {
         if (u.kind !== 'FARMER') throw httpError('Farmer authentication required', 403);
         const r = await doRedeem({ farmerId: u.sub, points, distributorId: null, channel: 'APP', note });
         await logActivity(null, 'REDEEM_COINS', 'redemption', r.id, { points, via: 'farmer-app' });
+        return r;
+      },
+      distRedeemFarmerCoins: async (_p, { farmerCode, points, note }, ctx) => {
+        const u = assertAuth(ctx);
+        if (u.kind !== 'DISTRIBUTOR') throw httpError('Distributor authentication required', 403);
+        const f = (await query('SELECT id FROM farmers WHERE farmer_code=$1', [farmerCode.trim()])).rows[0];
+        if (!f) throw httpError('No farmer with that reference code', 404);
+        const r = await doRedeem({ farmerId: f.id, points, distributorId: u.sub, channel: 'DISTRIBUTOR', note });
+        await logActivity(null, 'REDEEM_COINS', 'redemption', r.id, { farmerCode, points, via: 'distributor-app' });
         return r;
       },
       settleDistributor: async (_p, { distributorId }, ctx) => {

@@ -1196,6 +1196,20 @@ CREATE TABLE IF NOT EXISTS redemptions (
 CREATE INDEX IF NOT EXISTS idx_redemption_distributor ON redemptions(distributor_id, settled);
 CREATE INDEX IF NOT EXISTS idx_redemption_farmer ON redemptions(farmer_id, created_at DESC);
 
+-- ── Distributor App authentication: distributors are created by admin (with an
+-- email); they sign in to the Distributor App with Google. Only an email that
+-- already exists on an active distributor row may log in (no self-signup). ──
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'ADMIN'; -- ADMIN / GOOGLE
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS google_id TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS photo_url TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en';
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS fcm_token TEXT; -- Distributor App device token (push)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_distributors_email_lower ON distributors (lower(email)) WHERE email IS NOT NULL;
+
+-- Crop diagnoses can now originate from the Distributor App too (distributor-scoped history).
+ALTER TABLE crop_diagnoses ADD COLUMN IF NOT EXISTS distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_diag_distributor ON crop_diagnoses(distributor_id, created_at DESC);
+
 -- ============================================================================
--- End of schema (… + geo/enquiries + loyalty redemption)
+-- End of schema (… + geo/enquiries + loyalty redemption + distributor app)
 -- ============================================================================

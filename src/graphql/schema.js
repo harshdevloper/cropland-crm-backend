@@ -29,6 +29,7 @@ import { partyTypeDefs } from './modules/parties.js';
 import { forecastTypeDefs } from './modules/forecast.js';
 import { whatsappTypeDefs } from './modules/whatsapp.js';
 import { farmerAppTypeDefs } from './modules/farmerApp.js';
+import { distributorAppTypeDefs } from './modules/distributorApp.js';
 import { enquiryTypeDefs } from './modules/enquiries.js';
 import { redemptionTypeDefs } from './modules/redemptions.js';
 import { translateTypeDefs } from './modules/translate.js';
@@ -73,6 +74,7 @@ export const schema = [
   forecastTypeDefs,
   whatsappTypeDefs,
   farmerAppTypeDefs,
+  distributorAppTypeDefs,
   enquiryTypeDefs,
   redemptionTypeDefs,
   translateTypeDefs,
