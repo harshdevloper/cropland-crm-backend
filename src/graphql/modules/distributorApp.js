@@ -6,7 +6,7 @@
 // admin-created distributor and an app login are one and the same record.
 
 import { query, withTransaction } from '../../db/index.js';
-import { assertAuth } from '../context.js';
+import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
 import { getWeather, weatherConfigured } from '../../services/weather/index.js';
 import { diagnoseCrop } from '../../services/ai/index.js';
@@ -87,8 +87,27 @@ export const distributorAppTypeDefs = /* GraphQL */ `
     notes: String
     items: [DistSaleLine!]!
     createdAt: DateTime!
+    distributorId: ID       # populated for admin listings
+    distributorName: String # populated for admin listings
   }
   type DistSaleStats { totalSold: Float!, totalPaid: Float!, outstanding: Float!, count: Int! }
+
+  # A farmer this distributor deals with (registered by them or billed by them).
+  type DistFarmer {
+    id: ID!
+    farmerCode: String!
+    name: String!
+    phone: String
+    village: String
+    district: String
+    crops: [String!]!
+    pointsBalance: Int!
+    billCount: Int!
+    totalBilled: Float!
+    totalPaid: Float!
+    balanceDue: Float!
+    lastSaleDate: String
+  }
 
   extend type AppProduct { gstPercent: Float }
 
@@ -114,6 +133,9 @@ export const distributorAppTypeDefs = /* GraphQL */ `
     distFarmerLookup(farmerCode: String!): DistFarmerLookup!
     distSales(search: String): [DistSale!]!
     distSaleStats: DistSaleStats!
+    distFarmers: [DistFarmer!]!
+    # Admin panel: bills created by distributors in the Distributor App.
+    adminDistributorSales(distributorId: ID, billType: String, search: String, dateFrom: String, dateTo: String, limit: Int = 200): [DistSale!]!
   }
 
   extend type Mutation {
@@ -122,6 +144,8 @@ export const distributorAppTypeDefs = /* GraphQL */ `
     registerMyDistributorDevice(fcmToken: String!): Boolean!
     distRunDiagnosis(crop: String!, imageUrl: String): AppDiagnosis!
     distCreateSale(input: DistCreateSaleInput!): DistSale!
+    # Collect the remaining balance (or part of it) on a bill the distributor raised.
+    distRecordSalePayment(saleId: ID!, amount: Float!): DistSale!
   }
 `;
 
@@ -133,6 +157,7 @@ const mapSale = (r) => r && {
   totalAmount: num(r.total_amount) ?? 0, amountPaid: num(r.amount_paid) ?? 0,
   balanceDue: round2((num(r.total_amount) ?? 0) - (num(r.amount_paid) ?? 0)),
   paymentMethod: r.payment_method, notes: r.notes, createdAt: r.created_at,
+  distributorId: r.distributor_id ?? null, distributorName: r.distributor_name ?? null,
 };
 
 const mapProfile = (r) => r && {
@@ -294,6 +319,53 @@ export function distributorAppResolvers(app) {
         const sold = num(rows[0].total_sold) ?? 0, paid = num(rows[0].total_paid) ?? 0;
         return { totalSold: sold, totalPaid: paid, outstanding: Math.round((sold - paid) * 100) / 100, count: rows[0].count };
       },
+
+      // Farmers this distributor deals with — registered by them or billed by them —
+      // with a per-farmer billing summary for the app's "Farmers" tab.
+      distFarmers: async (_p, _a, ctx) => {
+        const id = distributorId(ctx);
+        const { rows } = await query(
+          `SELECT f.id, f.farmer_code, f.name, f.phone, f.village, f.district, f.crops, f.points_balance,
+                  COALESCE(s.bill_count,0)::int bill_count, COALESCE(s.total_billed,0) total_billed,
+                  COALESCE(s.total_paid,0) total_paid, s.last_sale_date
+           FROM farmers f
+           LEFT JOIN (
+             SELECT farmer_id, COUNT(*) bill_count, SUM(total_amount) total_billed, SUM(amount_paid) total_paid, MAX(sale_date) last_sale_date
+             FROM distributor_sales WHERE distributor_id = $1 AND farmer_id IS NOT NULL GROUP BY farmer_id
+           ) s ON s.farmer_id = f.id
+           WHERE f.registered_by = $1 OR s.farmer_id IS NOT NULL
+           ORDER BY (s.last_sale_date IS NULL), s.last_sale_date DESC NULLS LAST, f.name`,
+          [id],
+        );
+        return rows.map((r) => {
+          const billed = num(r.total_billed) ?? 0, paid = num(r.total_paid) ?? 0;
+          return {
+            id: r.id, farmerCode: r.farmer_code, name: r.name, phone: r.phone, village: r.village, district: r.district,
+            crops: r.crops ?? [], pointsBalance: r.points_balance ?? 0, billCount: r.bill_count,
+            totalBilled: billed, totalPaid: paid, balanceDue: round2(billed - paid),
+            lastSaleDate: r.last_sale_date ? isoDate(r.last_sale_date) : null,
+          };
+        });
+      },
+
+      // Admin: all distributor-app bills (optionally filtered by distributor / bill type / search / date).
+      adminDistributorSales: async (_p, { distributorId: did, billType, search, dateFrom, dateTo, limit }, ctx) => {
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const { rows } = await query(
+          `SELECT s.*, f.farmer_code, d.name distributor_name
+           FROM distributor_sales s
+           LEFT JOIN farmers f ON f.id = s.farmer_id
+           JOIN distributors d ON d.id = s.distributor_id
+           WHERE ($1::uuid IS NULL OR s.distributor_id = $1)
+             AND ($2::text IS NULL OR s.bill_no ILIKE '%'||$2||'%' OR s.buyer_name ILIKE '%'||$2||'%' OR d.name ILIKE '%'||$2||'%')
+             AND ($3::text IS NULL OR s.bill_type = $3)
+             AND ($4::date IS NULL OR s.sale_date >= $4::date)
+             AND ($5::date IS NULL OR s.sale_date <= $5::date)
+           ORDER BY s.created_at DESC LIMIT $6`,
+          [did ?? null, search && search.trim() ? search.trim() : null, billType ?? null, dateFrom ?? null, dateTo ?? null, limit],
+        );
+        return rows.map(mapSale);
+      },
     },
 
     Mutation: {
@@ -417,6 +489,31 @@ export function distributorAppResolvers(app) {
           const code = farmerId ? (await client.query('SELECT farmer_code FROM farmers WHERE id=$1', [farmerId])).rows[0]?.farmer_code : null;
           return mapSale({ ...sale, farmer_code: code });
         });
+      },
+
+      // Collect the remaining balance (or a partial payment) on a distributor's bill.
+      distRecordSalePayment: async (_p, { saleId, amount }, ctx) => {
+        const id = distributorId(ctx);
+        if (!(amount > 0)) throw httpError('Enter an amount greater than 0', 400);
+        const s = (await query('SELECT * FROM distributor_sales WHERE id = $1 AND distributor_id = $2', [saleId, id])).rows[0];
+        if (!s) throw httpError('Bill not found', 404);
+        const total = num(s.total_amount) ?? 0, already = num(s.amount_paid) ?? 0;
+        const balance = round2(total - already);
+        if (balance <= 0) throw httpError('This bill is already fully paid', 400);
+        const newPaid = round2(Math.min(total, already + amount));
+        const { rows } = await query(
+          `UPDATE distributor_sales s SET amount_paid = $2 FROM (SELECT farmer_code FROM farmers WHERE id = $3) f
+           WHERE s.id = $1 RETURNING s.*, $4::text farmer_code`,
+          [saleId, newPaid, s.farmer_id, s.farmer_id ? null : null],
+        );
+        // Re-fetch with farmer_code join for a clean mapped result.
+        const out = (await query(
+          'SELECT s.*, f.farmer_code FROM distributor_sales s LEFT JOIN farmers f ON f.id = s.farmer_id WHERE s.id = $1',
+          [saleId],
+        )).rows[0];
+        void rows;
+        await logActivity(null, 'DIST_SALE_PAYMENT', 'distributor_sale', saleId, { amount, newPaid, via: 'distributor-app' });
+        return mapSale(out);
       },
     },
 

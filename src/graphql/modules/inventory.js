@@ -31,6 +31,8 @@ export const inventoryTypeDefs = /* GraphQL */ `
     available: Float!
     reorderLevel: Float!
     isLow: Boolean!
+    unitPrice: Float!     # valuation price (distributor → dealer → MRP)
+    stockValue: Float!    # unitPrice × available quantity
     updatedAt: DateTime!
   }
 
@@ -43,6 +45,15 @@ export const inventoryTypeDefs = /* GraphQL */ `
     quantity: Float!
     reason: String
     createdAt: DateTime!
+    # Counterparty / document this movement relates to (e.g. who the stock was billed to).
+    refType: String
+    documentNo: String
+    invoiceId: ID         # the bill/invoice for this dispatch, if any
+    recipientType: String
+    recipientName: String
+    recipientPhone: String
+    recipientContact: String
+    recipientGstin: String
   }
 
   type InventoryStats {
@@ -98,27 +109,34 @@ const mapWarehouse = (r) =>
     createdAt: r.created_at,
   };
 
-const mapStock = (r) => ({
-  id: r.id,
-  warehouseId: r.warehouse_id,
-  warehouseName: r.warehouse_name,
-  productId: r.product_id,
-  productName: r.product_name,
-  productSku: r.product_sku,
-  uom: r.uom,
-  batchId: r.batch_id,
-  batchNumber: r.batch_number,
-  expiryDate: isoDate(r.expiry_date),
-  quantity: num(r.quantity) ?? 0,
-  reserved: num(r.reserved) ?? 0,
-  available: (num(r.quantity) ?? 0) - (num(r.reserved) ?? 0),
-  reorderLevel: num(r.reorder_level) ?? 0,
-  isLow: (num(r.quantity) ?? 0) <= (num(r.reorder_level) ?? 0),
-  updatedAt: r.updated_at,
-});
+const mapStock = (r) => {
+  const available = (num(r.quantity) ?? 0) - (num(r.reserved) ?? 0);
+  const unitPrice = num(r.distributor_price) ?? num(r.dealer_price) ?? num(r.mrp) ?? 0;
+  return {
+    id: r.id,
+    warehouseId: r.warehouse_id,
+    warehouseName: r.warehouse_name,
+    productId: r.product_id,
+    productName: r.product_name,
+    productSku: r.product_sku,
+    uom: r.uom,
+    batchId: r.batch_id,
+    batchNumber: r.batch_number,
+    expiryDate: isoDate(r.expiry_date),
+    quantity: num(r.quantity) ?? 0,
+    reserved: num(r.reserved) ?? 0,
+    available,
+    reorderLevel: num(r.reorder_level) ?? 0,
+    isLow: (num(r.quantity) ?? 0) <= (num(r.reorder_level) ?? 0),
+    unitPrice,
+    stockValue: Math.round(unitPrice * available * 100) / 100,
+    updatedAt: r.updated_at,
+  };
+};
 
 const STOCK_SELECT = `
   SELECT sl.*, w.name AS warehouse_name, p.name AS product_name, p.sku AS product_sku, p.uom AS uom,
+         p.distributor_price, p.dealer_price, p.mrp,
          b.batch_number, b.expiry_date
   FROM stock_levels sl
   JOIN warehouses w ON w.id = sl.warehouse_id
@@ -153,26 +171,47 @@ export function inventoryResolvers() {
       },
       stockMovements: async (_p, { productId, limit }, ctx) => {
         assertAuth(ctx);
+        // OUT movements carry ref_id = order_id (dispatch on invoice). Resolve the
+        // order's counterparty (distributor or farmer) so the timeline shows who got the stock.
         const { rows } = await query(
-          `SELECT m.*, w.name AS warehouse_name, p.name AS product_name, b.batch_number
+          `SELECT m.*, w.name AS warehouse_name, p.name AS product_name, b.batch_number,
+                  o.order_no AS document_no, o.customer_type, iv.id AS invoice_id,
+                  d.name AS distributor_name, d.phone AS distributor_phone,
+                  d.contact_person AS distributor_contact, d.gstin AS distributor_gstin,
+                  f.name AS farmer_name, f.phone AS farmer_phone, f.village AS farmer_village
            FROM stock_movements m
            JOIN warehouses w ON w.id = m.warehouse_id
            JOIN products p ON p.id = m.product_id
            LEFT JOIN batches b ON b.id = m.batch_id
+           LEFT JOIN orders o ON m.ref_type = 'invoice' AND o.id = m.ref_id
+           LEFT JOIN invoices iv ON iv.order_id = m.ref_id AND m.ref_type = 'invoice'
+           LEFT JOIN distributors d ON o.customer_type <> 'FARMER' AND d.id = o.distributor_id
+           LEFT JOIN farmers f ON o.customer_type = 'FARMER' AND f.id = o.farmer_id
            WHERE ($1::uuid IS NULL OR m.product_id = $1)
            ORDER BY m.created_at DESC LIMIT $2`,
           [productId ?? null, limit],
         );
-        return rows.map((r) => ({
-          id: r.id,
-          warehouseName: r.warehouse_name,
-          productName: r.product_name,
-          batchNumber: r.batch_number,
-          movementType: r.movement_type,
-          quantity: num(r.quantity),
-          reason: r.reason,
-          createdAt: r.created_at,
-        }));
+        return rows.map((r) => {
+          const isFarmer = r.customer_type === 'FARMER';
+          return {
+            id: r.id,
+            warehouseName: r.warehouse_name,
+            productName: r.product_name,
+            batchNumber: r.batch_number,
+            movementType: r.movement_type,
+            quantity: num(r.quantity),
+            reason: r.reason,
+            createdAt: r.created_at,
+            refType: r.ref_type,
+            documentNo: r.document_no ?? null,
+            invoiceId: r.invoice_id ?? null,
+            recipientType: r.document_no ? (isFarmer ? 'FARMER' : 'DISTRIBUTOR') : null,
+            recipientName: isFarmer ? r.farmer_name : r.distributor_name,
+            recipientPhone: isFarmer ? r.farmer_phone : r.distributor_phone,
+            recipientContact: isFarmer ? r.farmer_village : r.distributor_contact,
+            recipientGstin: isFarmer ? null : r.distributor_gstin,
+          };
+        });
       },
       inventoryStats: async (_p, _a, ctx) => {
         assertAuth(ctx);
