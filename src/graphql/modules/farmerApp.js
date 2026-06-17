@@ -9,6 +9,7 @@ import { assertAuth } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
 import { getWeather, weatherConfigured } from '../../services/weather/index.js';
 import { diagnoseCrop } from '../../services/ai/index.js';
+import { getTrainingReferences } from './ai.js';
 import { isAwsConfigured, getDownloadUrl } from '../../utils/aws.js';
 import { env } from '../../config/env.js';
 
@@ -402,14 +403,9 @@ export function farmerAppResolvers(app) {
       runMyDiagnosis: async (_p, { crop, imageUrl }, ctx) => {
         const id = farmerId(ctx);
         const lang = (await query('SELECT language FROM farmers WHERE id=$1', [id])).rows[0]?.language;
-        // Few-shot grounding from Train AI Doctor (reuse trained reference photos for this crop).
-        const refs = (await query(
-          `SELECT s.image_url AS "imageUrl", s.caption, c.disease, c.pathogen
-           FROM ai_training_samples s JOIN ai_training_classes c ON c.id = s.class_id
-           WHERE c.is_active AND c.crop ILIKE $1 ORDER BY c.created_at DESC LIMIT 6`,
-          [crop],
-        )).rows;
-        const d = await diagnoseCrop({ crop, imageUrl, references: refs, lang });
+        // Full RAG grounding: Pinecone → in-memory cosine → recent fallback (same as admin).
+        const { references } = await getTrainingReferences(crop, imageUrl);
+        const d = await diagnoseCrop({ crop, imageUrl, references, lang });
         const productIds = await matchProductsForApp(crop, d.disease);
         const sessionNo = `CD-${String((await query("SELECT nextval('diag_seq') n")).rows[0].n).padStart(5, '0')}`;
         const { rows } = await query(

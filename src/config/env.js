@@ -81,12 +81,15 @@ export const env = {
     apiKey: optional('OPENWEATHER_API_KEY', ''),
   },
 
-  // AI Layer — Google Gemini (PRD §9.4-9.5). Degrades to a deterministic mock when unset.
+  // AI Layer — Groq for generation, Gemini for embeddings only.
+  // Degrades to a deterministic mock when GROQ_API_KEY is unset.
   ai: {
-    geminiApiKey: optional('GEMINI_API_KEY', ''),
-    geminiModel: optional('GEMINI_MODEL', 'gemini-2.5-flash'),
+    groqApiKey: optional('GROQ_API_KEY', ''),
+    groqModel: optional('GROQ_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct'),
+    // Gemini is retained for embeddings only (Groq has no embedding model).
     // gemini-embedding-001 supports Matryoshka truncation; we request 768 dims to
     // match the Pinecone index dimension.
+    geminiApiKey: optional('GEMINI_API_KEY', ''),
     embeddingModel: optional('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-001'),
     embeddingDim: Number(optional('GEMINI_EMBEDDING_DIM', '768')),
   },

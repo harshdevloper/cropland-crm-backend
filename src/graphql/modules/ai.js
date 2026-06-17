@@ -208,7 +208,7 @@ const mapClass = (r) => r && {
 //   1. Pinecone vector search (scales to large training sets)
 //   2. Postgres + in-memory cosine over cached Gemini embeddings
 //   3. Most-recent labelled examples (still grounds the model, just not ranked)
-async function getTrainingReferences(crop, queryImageUrl) {
+export async function getTrainingReferences(crop, queryImageUrl) {
   // Embed the farmer's photo once; reused by both the Pinecone and in-memory paths.
   const q = queryImageUrl ? await embedSample(queryImageUrl, crop, crop) : null;
 
