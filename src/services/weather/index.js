@@ -62,17 +62,26 @@ function mockWeather(label) {
 function computeAlerts(current, forecast) {
   const alerts = [];
   const next = forecast[0] ?? {};
-  if ((current.rain1h ?? 0) > 5 || (next.rainMm ?? 0) > 5) {
-    alerts.push({ type: 'RAIN', severity: 'HIGH', title: 'Rain expected', detail: 'Rainfall > 5mm — spray window paused; postpone spraying.' });
+
+  // Decide spray guidance ONCE so we never emit contradictory advice
+  // (e.g. "postpone spraying" alongside "ideal for spraying").
+  const rainSoon = (current.rain1h ?? 0) > 5 || (next.rainMm ?? 0) > 5;
+  const heat     = current.temp > 40;
+  const frost    = Math.min(current.temp, next.min ?? current.temp) < 5;
+  const noRainSoon = (current.rain1h ?? 0) === 0 && (next.rainMm ?? 0) <= 1;
+  const calmWind   = current.windSpeed < 10;
+
+  if (rainSoon) {
+    alerts.push({ type: 'RAIN', severity: 'HIGH', title: 'Rain expected', detail: 'Rainfall > 5mm — postpone spraying until the rain clears.' });
   }
-  if (current.temp > 40) {
-    alerts.push({ type: 'HEAT', severity: 'HIGH', title: 'Heat stress', detail: 'Temperature above 40°C — advise irrigation and avoid mid-day spraying.' });
+  if (heat) {
+    alerts.push({ type: 'HEAT', severity: 'HIGH', title: 'Heat stress', detail: 'Temperature above 40°C — irrigate and spray only in the early morning or evening, never at mid-day.' });
   }
-  if (Math.min(current.temp, next.min ?? current.temp) < 5) {
+  if (frost) {
     alerts.push({ type: 'FROST', severity: 'MEDIUM', title: 'Frost risk', detail: 'Temperature below 5°C — protect vegetable crops.' });
   }
-  const noRainSoon = (current.rain1h ?? 0) === 0 && (next.rainMm ?? 0) <= 1;
-  if (noRainSoon && current.windSpeed < 10) {
+  // Only suggest a good spray window when nothing else advises against spraying.
+  if (!rainSoon && !heat && noRainSoon && calmWind) {
     alerts.push({ type: 'SPRAY_WINDOW', severity: 'LOW', title: 'Good spray window', detail: 'Low wind and no rain expected soon — ideal for spraying in the next few hours.' });
   }
   return alerts;
